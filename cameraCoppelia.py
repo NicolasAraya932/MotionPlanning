@@ -147,9 +147,5 @@ class CameraCoppelia:
         img_buffer, resX, resY = self.sim.getVisionSensorCharImage(self.camera_handle)
         # Convertir buffer a array NumPy dtype=uint8
         arr = np.frombuffer(img_buffer, dtype=np.uint8).reshape((resY, resX, 3))
-        # CoppeliaSim devuelve (x de izquierda a derecha, y de abajo hacia arriba, RGB).
-        # Para mostrar en OpenCV: BGR y voltear verticalmente:
-        #img_bgr = cv2.flip(cv2.cvtColor(arr, cv2.COLOR_RGB2BGR), 0)
-
-        # (b) Guardar un duplicado “crudo” de la imagen antes de dibujar
+        arr = cv2.flip(cv2.flip(arr, -1), 0)
         return arr, resX, resY
