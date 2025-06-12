@@ -85,6 +85,7 @@ for _ in range(1):
 
     else:
         print("No path found.")
+        exit(1)
 
 sim.stopSimulation()
 
@@ -93,13 +94,13 @@ time.sleep(0.5)
 path_world = [pixel_to_world_coordinates(camera, (x, y), depth_on_floor(camera, x, y)) for (y, x) in path]
 
 # PID controller for heading
-pid = PID(Kp=2.5, Ki=0.0, Kd=0.4)
+pid = PID(Kp=2.5, Ki=0.2, Kd=0.4)
 
 left_motor = sim.getObject('/PioneerP3DX/leftMotor')
 right_motor = sim.getObject('/PioneerP3DX/rightMotor')
 
 # Tuning params
-linear_speed = 0.7  # m/s
+linear_speed = 0.9  # m/s
 goal_tolerance = 0.2  # m
 dt = 0.05  # control step
 
@@ -109,8 +110,6 @@ time.sleep(0.5)
 for _ in range(1000):
     client.step()
     time.sleep(dt)
-
-    cv2_frame, resx, resy = camera.getFrame()
 
     # Get robot pose
     robot_pos = sim.getObjectPosition(robot_handle, -1)
@@ -156,7 +155,5 @@ for _ in range(1000):
 
     sim.setJointTargetVelocity(left_motor, vl)
     sim.setJointTargetVelocity(right_motor, vr)
-
-    cv2.imshow("",cv2_frame)
 
 sim.stopSimulation()
