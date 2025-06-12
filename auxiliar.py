@@ -111,21 +111,3 @@ def extract_wall_lines(mask,
     # strip angles
     wall_lines = [ (l[0], l[1]) for l in merged ]
     return wall_lines
-
-def polyline_to_grid(polyline3d, origin, resolution, width, height):
-    """
-    polyline3d: Nx3 world points
-    origin: (x0,y0) bottom‐left corner of grid
-    resolution: meters per cell
-    width, height: number of cells
-    """
-    grid = np.zeros((height, width), dtype=np.uint8)
-    pts2d = [((p[0]-origin[0])/resolution, (p[1]-origin[1])/resolution) for p in polyline3d]
-    for i in range(len(pts2d)-1):
-        x1,y1 = pts2d[i]
-        x2,y2 = pts2d[i+1]
-        cv2.line(grid, 
-                (int(x1),int(y1)), 
-                (int(x2),int(y2)),
-                color=1, thickness=1)
-    return grid
