@@ -2,174 +2,161 @@ import numpy as np
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 import time
 import cv2
+from cameraCoppelia import CameraCoppelia, world_to_pixel_coordinates, pixel_to_world_coordinates
+import matplotlib.pyplot as plt
+from auxiliar import *
+from astar import astar
+from PID import *
 
-# 1) Conexión
 client = RemoteAPIClient()
+client.setStepping(True)
+
 sim = client.getObject('sim')
-
 # 2) Handles
-camera_handle = sim.getObject('/SkyCamera')
 robot_handle  = sim.getObject('/PioneerP3DX')
+robot_gps_handle = sim.getObject('/PioneerP3DX/GPS')
+goal_gps_handle = sim.getObject('/goal/gps')
 
-# 3) Funciones auxiliares (euler→R, extrínsecos e intrínsecos)
-def euler_to_rot_matrix(euler):
-    alpha, beta, gamma = euler
-    Rz = np.array([
-        [ np.cos(alpha), -np.sin(alpha), 0 ],
-        [ np.sin(alpha),  np.cos(alpha), 0 ],
-        [             0,              0, 1 ]
-    ])
-    Ry = np.array([
-        [  np.cos(beta), 0, np.sin(beta) ],
-        [             0, 1,            0 ],
-        [ -np.sin(beta), 0, np.cos(beta) ]
-    ])
-    Rx = np.array([
-        [ 1,            0,             0 ],
-        [ 0, np.cos(gamma), -np.sin(gamma) ],
-        [ 0, np.sin(gamma),  np.cos(gamma) ]
-    ])
-    return Rz.dot(Ry).dot(Rx)
+camera = CameraCoppelia(sim, '/SkyCamera')
 
-def get_camera_extrinsics():
-    """
-    Devuelve (R_wc, t_wc), la rotación y traslación mundo→cámara.
-    """
-    # 1) Leer posición de la cámara en el mundo
-    cam_pos = sim.getObjectPosition(camera_handle, -1)  # [x_c, y_c, z_c]
-    t_c = np.array([[cam_pos[0]], [cam_pos[1]], [cam_pos[2]]])  # 3×1
+sim.startSimulation()
+for _ in range(1):
+    client.step()
+    time.sleep(0.5)
+    client.step()
+    cv2_frame, resx, resy = camera.getFrame()
 
-    # 2) Leer orientación en Euler ZYX
-    cam_euler = sim.getObjectOrientation(camera_handle, -1)    # [alpha, beta, gamma]
-    R_c = euler_to_rot_matrix(cam_euler)                       # Rotación cámara→mundo
+    # 1. Get Robot and Goal Positions (in world coordinates)
+    robot_pos = sim.getObjectPosition(robot_gps_handle, -1)
+    print('Robot Position:', robot_pos)
+    robot_u, robot_v = world_to_pixel_coordinates(camera, robot_pos[0], robot_pos[1], robot_pos[2])
 
-    # 3) Inversa: mundo→cámara
-    R_wc = R_c.T
-    t_wc = - R_c.T.dot(t_c)
+    goal_pos = sim.getObjectPosition(goal_gps_handle, -1)
+    print('Goal Position:', goal_pos)
+    goal_u, goal_v = world_to_pixel_coordinates(camera, goal_pos[0], goal_pos[1], goal_pos[2])  # pixel coordinates
 
-    return R_wc, t_wc
+    # 2. Segment walls from image
+    mask = segment_yellow_borders(cv2_frame)
 
-def get_camera_intrinsics():
-    """
-    Consulta la SkyCamera para obtener:
-      - Resolución (W, H)
-      - FOV vertical en radianes (fov_y), usando sim.getObjectFloatParameter
-    A partir de eso calcula:
-      f_y = (H/2) / tan(fov_y/2)
-      f_x = f_y * (W/H)
-      c_x = W/2
-      c_y = H/2
+    # 3. Extract walls using Hough transform
+    walls_uv = extract_wall_lines(mask)
 
-    Devuelve (K, W, H), donde K es la matriz intrínseca 3×3:
-        [ f_x   0    c_x ]
-        [  0   f_y   c_y ]
-        [  0    0     1  ]
-    """
-    # 1) Leer resolución de la SkyCamera
-    res = sim.getVisionSensorResolution(camera_handle)  # devuelve [W, H]
-    W, H = res[0], res[1]
+    # 4. Create occupancy grid (1 = free, 0 = obstacle)
+    grid = np.ones_like(mask, dtype=np.uint8)  # shape=(H,W)
+    for (u1, v1), (u2, v2) in walls_uv:
+        cv2.line(grid, (u1, v1), (u2, v2), 0, thickness=3)
 
-    # 2) Leer FOV vertical (radianes) de la SkyCamera
-    _, fov_y = sim.getObjectFloatParameter(
-        camera_handle,
-        sim.visionfloatparam_perspective_angle
-    )
+    # Optional: make walls thicker to account for robot size
+    kernel = np.ones((3,3), np.uint8)
+    grid = cv2.erode(grid, kernel)
 
-    # 3) Calcular f_y, f_x, c_x, c_y
-    f_y = (H / 2.0) / np.tan(fov_y / 2.0)
-    f_x = f_y * (W / float(H))
-    c_x = W / 2.0
-    c_y = H / 2.0
+    # Convertir dimensiones del robot a píxeles
+    K, W, H = camera.getIntrinsics()
+    fx = K[0, 0]
+    fy = K[1, 1]
 
-    K = np.array([
-        [ f_x,  0.0, c_x ],
-        [ 0.0,  f_y, c_y ],
-        [ 0.0,  0.0,  1.0 ]
-    ])
+    # Robot ocupa una elipse/círculo de radio aproximadamente (en píxeles)
+    robot_radius_x_px = int((0.2 / 2.0) * fx)
+    robot_radius_y_px = int((0.2 / 2.0) * fy)
 
-    return K, W, H
+    # Crear el kernel elíptico (estructura del robot)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * robot_radius_x_px, 2 * robot_radius_y_px))
 
-def world_to_pixel(X_w, Y_w, Z_w=0.0):
-    """
-    Proyecta (X_w, Y_w, Z_w) → (u, v), corrigiendo el espejado en X.
-    Retorna None si Z_c ≤ 0 (punto detrás de la cámara).
-    """
-    # 1) Coordenadas mundo
-    p_w = np.array([[X_w], [Y_w], [Z_w]])
+    # Inflar los obstáculos (0s) para que representen el espacio de colisión
+    inflated_grid = cv2.dilate(1 - grid, kernel)  # Invertir para que los obstáculos sean 1s → dilatar → revertir
+    inflated_grid = 1 - inflated_grid  # Volver a formato 1=libre, 0=obstáculo
 
-    # 2) Extrínsecos (mundo→cámara)
-    R_wc, t_wc = get_camera_extrinsics()
+    # A*
+    start = (int(robot_v), int(robot_u))  # asegúrate de usar coordenadas y,x
+    goal  = (int(goal_v), int(goal_u))
+    path = astar(inflated_grid, start, goal)
 
-    # 3) Convertir a cámara: p_c = R_wc·p_w + t_wc
-    p_c = R_wc.dot(p_w) + t_wc
-    X_c, Y_c, Z_c = p_c[0,0], p_c[1,0], p_c[2,0]
-    if Z_c <= 0:
-        return None
+    if path:
+        path = path[::50]  # reduce path resolution
+    
+    # Remove the first point if it's the robot's position
+    if path and path[0] == start:
+        path = path[1:]
 
-    # 4) Normalizar (invirtiendo X_c para corregir el espejado en la imagen)
-    x_n = -X_c / Z_c
-    y_n = -Y_c / Z_c - 0.12
+    if path:
+        # dibujar puntos con opencv
+        for (y, x) in path:
+            cv2.circle(cv2_frame, (x, y), 3, (255, 0, 0), -1)
 
-    # 5) Intrínsecos
-    K, W, H = get_camera_intrinsics()
-    f_x = K[0,0]
-    f_y = K[1,1]
-    c_x = K[0,2]
-    c_y = K[1,2]
+    else:
+        print("No path found.")
 
-    # 6) Proyección
-    u = f_x * x_n + c_x
-    v = f_y * y_n + c_y
-    return (u, v)
+sim.stopSimulation()
 
+time.sleep(0.5)
 
-# ------------------------------------------------------
-# 4) Loop de ejemplo: leer imagen + proyectar la posición
-# ------------------------------------------------------
-if __name__ == "__main__":
-    # 4.1) Iniciar simulación en modo “paso a paso” (stepping)
-    client.setStepping(True)
-    sim.startSimulation()
+path_world = [pixel_to_world_coordinates(camera, (x, y), depth_on_floor(camera, x, y)) for (y, x) in path]
 
-    time.sleep(0.5)  # esperar medio segundo antes de la primera lectura
+# PID controller for heading
+pid = PID(Kp=2.5, Ki=0.0, Kd=0.4)
 
-    # 4.2) Bucle: por ejemplo 100 iteraciones
-    for _ in range(100):
-        # (a) Tomar la imagen con sim.getVisionSensorCharImage → (buffer, W, H)
-        img_buffer, resX, resY = sim.getVisionSensorCharImage(camera_handle)
-        # Convertir buffer a array NumPy dtype=uint8
-        arr = np.frombuffer(img_buffer, dtype=np.uint8).reshape((resY, resX, 3))
-        # CoppeliaSim devuelve (x de izquierda a derecha, y de abajo hacia arriba, RGB).
-        # Para mostrar en OpenCV: BGR y voltear verticalmente:
-        img_bgr = cv2.flip(cv2.cvtColor(arr, cv2.COLOR_RGB2BGR), 0)
+left_motor = sim.getObject('/PioneerP3DX/leftMotor')
+right_motor = sim.getObject('/PioneerP3DX/rightMotor')
 
-        # (b) Guardar un duplicado “crudo” de la imagen antes de dibujar
-        img_raw = img_bgr.copy()
+# Tuning params
+linear_speed = 0.7  # m/s
+goal_tolerance = 0.2  # m
+dt = 0.05  # control step
 
-        # (c) Leer posición mundial del robot
-        pos_robot = sim.getObjectPosition(robot_handle, -1)  # [Xw, Yw, Zw]
-        Xw, Yw, Zw = pos_robot[0], pos_robot[1], pos_robot[2]
+sim.startSimulation()
+time.sleep(0.5)
 
-        # (d) Proyectar a píxel (u, v) sobre la copia “overlay”
-        img_overlay = img_bgr  # apuntamos al mismo array de img_bgr para dibujar encima
-        uv = world_to_pixel(Xw, Yw, Zw)
-        if uv is not None:
-            u, v = uv
-            u_int = int(round(u))
-            v_int = int(round(v))
-            if 0 <= u_int < resX and 0 <= v_int < resY:
-                cv2.circle(img_overlay, (u_int, v_int), 5, (0, 0, 255), -1)
+for _ in range(1000):
+    client.step()
+    time.sleep(dt)
 
-        # (e) Mostrar las dos ventanas simultáneamente
-        cv2.imshow("SkyCamera (Raw Frame)", img_raw)
-        cv2.imshow("SkyCamera (With Projection)", img_overlay)
-        key = cv2.waitKey(1)
-        if key == ord('q'):
-            break
+    cv2_frame, resx, resy = camera.getFrame()
 
-        # (f) Avanzar un paso de simulación
-        client.step()
+    # Get robot pose
+    robot_pos = sim.getObjectPosition(robot_handle, -1)
+    robot_ori = sim.getObjectOrientation(robot_handle, -1)
+    robot_theta = robot_ori[2]  # yaw
 
-    # 4.3) Detener simulación y cerrar ventanas
-    sim.stopSimulation()
-    cv2.destroyAllWindows()
+    # Display robot position as cv2.circle 
+    cv2.circle(cv2_frame, (int(robot_pos[0] * resx), int(robot_pos[1] * resy)), 5, (0, 255, 0), -1)
+
+    # Find nearest point in path_world
+    dists = [distance_2d(robot_pos, p) for p in path_world]
+    nearest_idx = int(np.argmin(dists))
+
+    # Stop if close to goal
+    if nearest_idx >= len(path_world) - 2:
+        print("Goal reached")
+        sim.setJointTargetVelocity(left_motor, 0)
+        sim.setJointTargetVelocity(right_motor, 0)
+        break
+
+    target = path_world[nearest_idx + 1]
+    dx = target[0] - robot_pos[0]
+    dy = target[1] - robot_pos[1]
+
+    # Compute desired heading
+    desired_theta = atan2(dy, dx)
+    heading_error = normalize_angle(desired_theta - robot_theta)
+
+    # PID for angular velocity
+    omega = pid.update(heading_error, dt)
+
+    # Constant forward speed if aligned
+    distance = distance_2d(robot_pos, target)
+    v = linear_speed if abs(heading_error) < pi / 4 else 0.0
+
+    # Convert to wheel velocities
+    left_motor_rel = sim.getObjectPosition(left_motor, robot_handle)
+    right_motor_rel = sim.getObjectPosition(right_motor, robot_handle)
+
+    L = np.linalg.norm(np.array(left_motor_rel[:2]) - np.array(right_motor_rel[:2]))
+    vl = v - omega * L / 2
+    vr = v + omega * L / 2
+
+    sim.setJointTargetVelocity(left_motor, vl)
+    sim.setJointTargetVelocity(right_motor, vr)
+
+    cv2.imshow("",cv2_frame)
+
+sim.stopSimulation()
